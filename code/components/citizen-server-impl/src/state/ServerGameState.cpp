@@ -92,6 +92,11 @@ std::shared_ptr<ConVar<bool>> g_oneSyncLengthHack;
 std::shared_ptr<ConVar<fx::OneSyncState>> g_oneSyncVar;
 std::shared_ptr<ConVar<bool>> g_oneSyncPopulation;
 std::shared_ptr<ConVar<bool>> g_oneSyncARQ;
+std::shared_ptr<ConVar<bool>> g_oneSyncParallelCulling;
+std::shared_ptr<ConVar<int>> g_oneSyncCullingClientsPerTick;
+std::shared_ptr<ConVar<bool>> g_oneSyncDistanceCullPlayers;
+std::shared_ptr<ConVar<int>> g_oneSyncPlayerScopeLimit;
+std::shared_ptr<ConVar<int>> g_oneSyncPlayerScopeHysteresis;
 
 static std::shared_ptr<ConVar<bool>> g_networkedSoundsEnabledVar;
 static bool g_networkedSoundsEnabled;
@@ -1000,36 +1005,75 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 	int initSlot = ((fx::IsBigMode()) ? MAX_CLIENTS : 129) - 1;
 
 	static int lastUpdateSlot = initSlot;
-	int iterations = 0;
-	int slot = lastUpdateSlot;
-	
-	while (iterations < ((fx::IsBigMode() ? 8 : 16) * tickMul))
+
+	int cullingClientsPerTick = g_oneSyncCullingClientsPerTick->GetValue();
+
+	if (cullingClientsPerTick <= 0)
 	{
-		iterations++;
+		cullingClientsPerTick = fx::IsBigMode() ? 8 : 16;
+	}
 
-		fx::ClientSharedPtr client;
+	const bool parallelCulling = g_oneSyncParallelCulling->GetValue();
 
-		while (!client)
+	eastl::fixed_vector<fx::ClientSharedPtr, MAX_CLIENTS> cullingClients;
+
+	{
+		int iterations = 0;
+		int slot = lastUpdateSlot;
+		eastl::bitset<roundToWord(MAX_CLIENTS)> gatheredSlots;
+
+		while (iterations < (cullingClientsPerTick * tickMul))
 		{
-			client = creg->GetClientBySlotID(slot);
-			slot--;
+			iterations++;
 
-			if (slot < 0)
+			fx::ClientSharedPtr client;
+
+			while (!client)
 			{
-				slot = initSlot;
+				client = creg->GetClientBySlotID(slot);
+				slot--;
+
+				if (slot < 0)
+				{
+					slot = initSlot;
+				}
+
+				if (slot == lastUpdateSlot)
+				{
+					break;
+				}
 			}
 
-			if (slot == lastUpdateSlot)
+			if (!client)
 			{
 				break;
 			}
+
+			if (parallelCulling)
+			{
+				auto clientSlot = client->GetSlotId();
+
+				if (clientSlot >= uint32_t(MAX_CLIENTS))
+				{
+					continue;
+				}
+
+				if (gatheredSlots.test(clientSlot))
+				{
+					break;
+				}
+
+				gatheredSlots.set(clientSlot);
+			}
+
+			cullingClients.push_back(std::move(client));
 		}
 
-		if (!client)
-		{
-			break;
-		}
+		lastUpdateSlot = slot;
+	}
 
+	auto processCullingClient = [&](const fx::ClientSharedPtr& client)
+	{
 		auto clientDataUnlocked = GetClientDataUnlocked(this, client);
 
 		sync::SyncEntityPtr playerEntity;
@@ -1048,8 +1092,125 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 		auto slotId = client->GetSlotId();
 		auto netId = client->GetNetId();
 
+		// resolved once here: grids are only created and erased by UpdateWorldGrid, earlier in this same tick
+		WorldGrid* worldGrid = nullptr;
+		{
+			std::shared_lock _(m_worldGridsMutex);
+
+			if (auto gridIt = m_worldGrids.find(clientDataUnlocked->routingBucket); gridIt != m_worldGrids.end())
+			{
+				worldGrid = gridIt->second.get();
+			}
+		}
+
 		auto& currentSyncedEntities = clientDataUnlocked->syncedEntities;
 		decltype(clientDataUnlocked->syncedEntities) newSyncedEntities{};
+
+		const bool distanceCullPlayers = fx::IsBigMode() && g_oneSyncDistanceCullPlayers->GetValue();
+		eastl::bitset<roundToWord(MaxObjectId)> admittedPlayers;
+
+		if (distanceCullPlayers && playerEntity)
+		{
+			// seats including the local player's own booking
+			constexpr int kEngineScopeLimit =
+#ifdef STATE_RDR3
+			30
+#else
+			127
+#endif
+			;
+
+			int scopeLimit = kEngineScopeLimit;
+
+			if (int scopeLimitVar = g_oneSyncPlayerScopeLimit->GetValue(); scopeLimitVar > 0 && scopeLimitVar < scopeLimit)
+			{
+				scopeLimit = scopeLimitVar;
+			}
+
+			const int maxRemotePlayers = scopeLimit - 1;
+
+			const float hysteresis = float(std::max(g_oneSyncPlayerScopeHysteresis->GetValue(), 0));
+
+			struct PlayerCandidate
+			{
+				uint16_t objectId;
+				float rankDist;
+			};
+
+			eastl::fixed_vector<PlayerCandidate, kGamePlayerCap, true> candidates;
+
+			for (int entityIndex = 0; entityIndex < maxValidEntity; entityIndex++)
+			{
+				const auto& entity = std::get<0>(relevantEntities[entityIndex]);
+				const auto& entityPos = std::get<1>(relevantEntities[entityIndex]);
+
+				if (entity->type != sync::NetObjEntityType::Player || entity == playerEntity)
+				{
+					continue;
+				}
+
+				if (entity->deleting || !entity->passedFilter)
+				{
+					continue;
+				}
+
+				if (entity->routingBucket != clientDataUnlocked->routingBucket)
+				{
+					continue;
+				}
+
+				{
+					std::shared_lock _(entity->guidMutex);
+
+					if (entity->deletedFor.test(slotId))
+					{
+						continue;
+					}
+				}
+
+				float distSquared = std::numeric_limits<float>::max();
+
+				for (const auto& playerPos : playerPosns)
+				{
+					float diffX = entityPos.x - playerPos.x;
+					float diffY = entityPos.y - playerPos.y;
+
+					distSquared = std::min(distSquared, (diffX * diffX) + (diffY * diffY));
+				}
+
+				if (distSquared >= entity->GetDistanceCullingRadius(clientDataUnlocked->GetPlayerCullingRadius()))
+				{
+					continue;
+				}
+
+				float rankDist = std::sqrt(distSquared);
+
+				if (hysteresis > 0.0f)
+				{
+					if (auto syncIt = currentSyncedEntities.find(MakeHandleUniqifierPair(entity->handle, entity->uniqifier)); syncIt != currentSyncedEntities.end() && syncIt->second.hasCreated)
+					{
+						rankDist = std::max(rankDist - hysteresis, 0.0f);
+					}
+				}
+
+				candidates.push_back({ uint16_t(entity->handle), rankDist });
+			}
+
+			if (candidates.size() > size_t(maxRemotePlayers))
+			{
+				std::nth_element(candidates.begin(), candidates.begin() + maxRemotePlayers, candidates.end(), [](const PlayerCandidate& left, const PlayerCandidate& right)
+				{
+					return left.rankDist < right.rankDist || (left.rankDist == right.rankDist && left.objectId < right.objectId);
+				});
+
+				candidates.resize(maxRemotePlayers);
+			}
+
+			for (const auto& candidate : candidates)
+			{
+				admittedPlayers.set(candidate.objectId);
+			}
+		}
 
 		for (int entityIndex = 0; entityIndex < maxValidEntity; entityIndex++)
 		{
@@ -1092,14 +1253,9 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 					int sectorX = std::max(entityPos.x + 8192.0f, 0.0f) / 150;
 					int sectorY = std::max(entityPos.y + 8192.0f, 0.0f) / 150;
 
-					auto selfBucket = clientDataUnlocked->routingBucket;
-
-					std::shared_lock _(m_worldGridsMutex);
-					const auto& grid = m_worldGrids[selfBucket];
-
-					if (grid && sectorX >= 0 && sectorY >= 0 && sectorX < 256 && sectorY < 256)
+					if (worldGrid && sectorX >= 0 && sectorY >= 0 && sectorX < 256 && sectorY < 256)
 					{
-						if (grid->accel.netIDs[sectorX][sectorY] == netId)
+						if (worldGrid->accel.netIDs[sectorX][sectorY] == netId)
 						{
 							return true;
 						}
@@ -1201,6 +1357,11 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 				{
 					isRelevant = false;
 				}
+			}
+
+			if (distanceCullPlayers && entity->type == sync::NetObjEntityType::Player && !ownsEntity && !admittedPlayers.test(entity->handle))
+			{
+				isRelevant = false;
 			}
 
 			// if we own this entity, we need to assign as relevant.
@@ -1375,9 +1536,19 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			std::unique_lock _(clientDataUnlocked->selfMutex);
 			clientDataUnlocked->syncedEntities = std::move(newSyncedEntities);
 		}
-	}
+	};
 
-	lastUpdateSlot = slot;
+	if (parallelCulling)
+	{
+		tbb::parallel_for_each(cullingClients.begin(), cullingClients.end(), processCullingClient);
+	}
+	else
+	{
+		for (auto& cullingClient : cullingClients)
+		{
+			processCullingClient(cullingClient);
+		}
+	}
 
 	auto curTime = msec();
 
@@ -7912,6 +8083,11 @@ static InitFunction initFunction([]()
 		g_oneSyncRadiusFrequency = instance->AddVariable<bool>("onesync_radiusFrequency", ConVar_None, true);
 		g_oneSyncLogVar = instance->AddVariable<std::string>("onesync_logFile", ConVar_None, "");
 		g_oneSyncWorkaround763185 = instance->AddVariable<bool>("onesync_workaround763185", ConVar_None, false);
+		g_oneSyncParallelCulling = instance->AddVariable<bool>("onesync_parallelCulling", ConVar_None, false);
+		g_oneSyncCullingClientsPerTick = instance->AddVariable<int>("onesync_cullingClientsPerTick", ConVar_None, 0);
+		g_oneSyncDistanceCullPlayers = instance->AddVariable<bool>("onesync_distanceCullPlayers", ConVar_None, false);
+		g_oneSyncPlayerScopeLimit = instance->AddVariable<int>("onesync_playerScopeLimit", ConVar_None, 0);
+		g_oneSyncPlayerScopeHysteresis = instance->AddVariable<int>("onesync_playerScopeHysteresis", ConVar_None, 0);
 
 		fwRefContainer<fx::ServerGameState> sgs = new fx::ServerGameState();
 		instance->SetComponent(sgs);
