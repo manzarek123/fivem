@@ -919,7 +919,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 		fx::sync::SyncEntityPtr,
 		glm::vec3,
 		sync::CVehicleGameStateNodeData*,
-		fx::ClientWeakPtr
+		uint32_t
 	> relevantEntities[MaxObjectId + 1];
 
 	int maxValidEntity = 0;
@@ -995,7 +995,8 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 				vehicleData = entity->syncTree->GetVehicleGameState();
 			}
 			
-			relevantEntities[maxValidEntity] = { entity, entityPosition, vehicleData, entity->GetClient() };
+			auto entityClient = entity->GetClient();
+			relevantEntities[maxValidEntity] = { entity, entityPosition, vehicleData, entityClient ? entityClient->GetNetId() : ~0u };
 			maxValidEntity++;
 		}
 	}
@@ -1107,6 +1108,9 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 		decltype(clientDataUnlocked->syncedEntities) newSyncedEntities{};
 
 		const bool distanceCullPlayers = fx::IsBigMode() && g_oneSyncDistanceCullPlayers->GetValue();
+		const bool oneSyncCulling = g_oneSyncCulling->GetValue();
+		const bool oneSyncVehicleCulling = g_oneSyncVehicleCulling->GetValue();
+		const bool oneSyncRadiusFrequency = g_oneSyncRadiusFrequency->GetValue();
 		eastl::bitset<roundToWord(MaxObjectId)> admittedPlayers;
 
 		if (distanceCullPlayers && playerEntity)
@@ -1214,9 +1218,8 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 
 		for (int entityIndex = 0; entityIndex < maxValidEntity; entityIndex++)
 		{
-			const auto& [entity, entityPos, vehicleData, entityClientWeak] = relevantEntities[entityIndex];
-			auto entityClient = entityClientWeak.lock();
-			auto ownsEntity = entityClient && entityClient->GetNetId() == client->GetNetId();
+			const auto& [entity, entityPos, vehicleData, entityOwnerNetId] = relevantEntities[entityIndex];
+			auto ownsEntity = entityOwnerNetId == netId;
 
 			{
 				std::shared_lock _(entity->guidMutex);
@@ -1226,7 +1229,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 				}
 			}
 			
-			bool isRelevant = (g_oneSyncCulling->GetValue()) ? false : true;
+			bool isRelevant = (oneSyncCulling) ? false : true;
 
 			if (ownsEntity && entity->type == fx::sync::NetObjEntityType::Player)
 			{
@@ -1304,7 +1307,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 					{
 						if (vehicleData->playerOccupants.any())
 						{
-							if (!g_oneSyncVehicleCulling->GetValue() && !fx::IsBigMode())
+							if (!oneSyncVehicleCulling && !fx::IsBigMode())
 							{
 								isRelevant = true;
 							}
@@ -1426,7 +1429,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			// only update sync delay if should-be-created
 			// isRelevant should **not** be updated after this
 			auto syncDelay = 50ms;
-			if (isRelevant && g_oneSyncRadiusFrequency->GetValue() && !isPlayerOrVehicle)
+			if (isRelevant && oneSyncRadiusFrequency && !isPlayerOrVehicle)
 			{
 				const auto& position = entityPos;
 
