@@ -1571,9 +1571,13 @@ static void Init()
 
 			std::set<int> rts{ -1 };
 
-			for (auto i = entity->relevantTo.find_first(); i != decltype(entity->relevantTo)::kSize; i = entity->relevantTo.find_next(i))
 			{
-				rts.insert(i);
+				std::shared_lock l(entity->guidMutex);
+
+				for (auto i = entity->relevantTo.find_first(); i != decltype(entity->relevantTo)::kSize; i = entity->relevantTo.find_next(i))
+				{
+					rts.insert(i);
+				}
 			}
 
 			stateBag->SetRoutingTargets(rts);

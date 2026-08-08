@@ -1075,6 +1075,14 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 
 	auto processCullingClient = [&](const fx::ClientSharedPtr& client)
 	{
+		// read once and validate: after a drop, GetSlotId() would return an out-of-bounds bitset index
+		const uint32_t slotId = client->GetSlotId();
+
+		if (slotId >= uint32_t(MAX_CLIENTS))
+		{
+			return;
+		}
+
 		auto clientDataUnlocked = GetClientDataUnlocked(this, client);
 
 		sync::SyncEntityPtr playerEntity;
@@ -1090,15 +1098,17 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			playerPosns = GetPlayerFocusPos(playerEntity);
 		}
 
-		auto slotId = client->GetSlotId();
 		auto netId = client->GetNetId();
+
+		// snapshot once: svMain can mutate this mid-pass and the double-read would flip relevance/wantsReassign
+		const uint32_t clientRoutingBucket = clientDataUnlocked->routingBucket;
 
 		// resolved once here: grids are only created and erased by UpdateWorldGrid, earlier in this same tick
 		WorldGrid* worldGrid = nullptr;
 		{
 			std::shared_lock _(m_worldGridsMutex);
 
-			if (auto gridIt = m_worldGrids.find(clientDataUnlocked->routingBucket); gridIt != m_worldGrids.end())
+			if (auto gridIt = m_worldGrids.find(clientRoutingBucket); gridIt != m_worldGrids.end())
 			{
 				worldGrid = gridIt->second.get();
 			}
@@ -1158,7 +1168,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 					continue;
 				}
 
-				if (entity->routingBucket != clientDataUnlocked->routingBucket)
+				if (entity->routingBucket != clientRoutingBucket)
 				{
 					continue;
 				}
@@ -1354,7 +1364,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			}
 
 			// don't route entities that aren't part of the routing bucket
-			if (clientDataUnlocked->routingBucket != entity->routingBucket)
+			if (clientRoutingBucket != entity->routingBucket)
 			{
 				if (!(entity == playerEntity))
 				{
@@ -1384,7 +1394,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 
 					// but don't force it to exist for ourselves if it's not script-owned
 					// (also, if not hasSynced, we can't tell if a script owns it or not, so we may delete early)
-					if ((!entity->hasSynced || entity->IsOwnedByClientScript()) && entity->routingBucket == clientDataUnlocked->routingBucket)
+					if ((!entity->hasSynced || entity->IsOwnedByClientScript()) && entity->routingBucket == clientRoutingBucket)
 					{
 						isRelevant = true;
 					}
@@ -1572,12 +1582,12 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 		// no
 		// #TODO: imagine if this mutates state alongside but after OnDrop clears it. WHAT COULD GO WRONG?
 		// serialize OnDrop for gamestate onto the sync thread?
-		if (!client->HasSlotId())
+		const uint32_t slotId = client->GetSlotId();
+
+		if (slotId >= uint32_t(MAX_CLIENTS))
 		{
 			return;
 		}
-
-		auto slotId = client->GetSlotId();
 
 		uint64_t time = curTime.count();
 
@@ -1654,18 +1664,22 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 				{
 					std::unique_lock _(entity->guidMutex);
 					entity->relevantTo.reset(slotId);
+
+					// permanent deletion?
+					if (!deletionData.outOfScope)
+					{
+						entity->deletedFor.set(slotId);
+					}
+					// entity still exists, just going out of scope
+					else
+					{
+						entity->outOfScopeFor.set(slotId);
+					}
 				}
 
-				// permanent deletion?
-				if (!deletionData.outOfScope)
-				{
-					entity->deletedFor.set(slotId);
-				}	
 				// entity still exists, just going out of scope
-				else
+				if (deletionData.outOfScope)
 				{
-					entity->outOfScopeFor.set(slotId);
-
 					auto entityClient = entity->GetClient();
 
 					// if the entity still exists, and this is the *owner* we're deleting it for
@@ -4046,7 +4060,13 @@ void ServerGameState::ParseAckPacket(const fx::ClientSharedPtr& client, net::Byt
 
 					if (syncTree)
 					{
-						entity->deletedFor.reset(client->GetSlotId());
+						const uint32_t slotId = client->GetSlotId();
+
+						if (slotId < uint32_t(MAX_CLIENTS))
+						{
+							std::lock_guard<std::shared_mutex> _(entity->guidMutex);
+							entity->deletedFor.reset(slotId);
+						}
 						
 						auto [lock, clientData] = GetClientData(this, client);
 						if (auto secIt = clientData->syncedEntities.find(MakeHandleUniqifierPair(objectId, uniqifier)); secIt != clientData->syncedEntities.end())
@@ -8090,7 +8110,7 @@ static InitFunction initFunction([]()
 		g_oneSyncCullingClientsPerTick = instance->AddVariable<int>("onesync_cullingClientsPerTick", ConVar_None, 0);
 		g_oneSyncDistanceCullPlayers = instance->AddVariable<bool>("onesync_distanceCullPlayers", ConVar_None, false);
 		g_oneSyncPlayerScopeLimit = instance->AddVariable<int>("onesync_playerScopeLimit", ConVar_None, 0);
-		g_oneSyncPlayerScopeHysteresis = instance->AddVariable<int>("onesync_playerScopeHysteresis", ConVar_None, 0);
+		g_oneSyncPlayerScopeHysteresis = instance->AddVariable<int>("onesync_playerScopeHysteresis", ConVar_None, 2);
 
 		fwRefContainer<fx::ServerGameState> sgs = new fx::ServerGameState();
 		instance->SetComponent(sgs);
