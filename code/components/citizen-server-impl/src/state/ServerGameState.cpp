@@ -1265,7 +1265,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 						}
 					}
 
-					// are we owning the world grid in which this entity exists?
+					// sector ownership only keeps ambient population relevant, else a distant owner never releases script entities
 					int sectorX = std::max(entityPos.x + 8192.0f, 0.0f) / 150;
 					int sectorY = std::max(entityPos.y + 8192.0f, 0.0f) / 150;
 
@@ -1273,7 +1273,14 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 					{
 						if (worldGrid->accel.netIDs[sectorX][sectorY] == netId)
 						{
-							return true;
+							sync::ePopType popType;
+
+							if (entity->syncTree->GetPopulationType(&popType) &&
+								(popType == sync::POPTYPE_RANDOM_AMBIENT || popType == sync::POPTYPE_RANDOM_PARKED || popType == sync::POPTYPE_RANDOM_PATROL ||
+								popType == sync::POPTYPE_RANDOM_PERMANENT || popType == sync::POPTYPE_RANDOM_SCENARIO))
+							{
+								return true;
+							}
 						}
 					}
 				}
