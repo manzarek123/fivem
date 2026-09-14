@@ -97,6 +97,12 @@ std::shared_ptr<ConVar<int>> g_oneSyncCullingClientsPerTick;
 std::shared_ptr<ConVar<bool>> g_oneSyncDistanceCullPlayers;
 std::shared_ptr<ConVar<int>> g_oneSyncPlayerScopeLimit;
 std::shared_ptr<ConVar<int>> g_oneSyncPlayerScopeHysteresis;
+std::shared_ptr<ConVar<int>> g_oneSyncWorldGridRadius;
+std::shared_ptr<ConVar<bool>> g_oneSyncWorldGridNearestWins;
+std::shared_ptr<ConVar<int>> g_oneSyncWorldGridNearestWinsMargin;
+
+// focus position per netID from the last world grid pass, so contested sectors need no extra pass over the registry
+static eastl::fixed_hash_map<uint16_t, glm::vec2, MAX_CLIENTS> g_worldGridFocusPositions;
 
 static std::shared_ptr<ConVar<bool>> g_networkedSoundsEnabledVar;
 static bool g_networkedSoundsEnabled;
@@ -2551,6 +2557,11 @@ void ServerGameState::UpdateWorldGrid(fx::ServerInstanceBase* instance)
 		}
 	}
 
+	// 299 keeps the claim within 5x5 sectors, the most the 32 entries per slot can hold
+	const float claimRadius = float(std::clamp(g_oneSyncWorldGridRadius->GetValue(), 0, 299));
+	const bool nearestWins = g_oneSyncWorldGridNearestWins->GetValue();
+	const float nearestWinsMargin = float(std::clamp(g_oneSyncWorldGridNearestWinsMargin->GetValue(), 0, 299));
+
 	// update world grid
 	clientRegistry->ForAllClients([&](const fx::ClientSharedPtr& client)
 	{
@@ -2584,10 +2595,12 @@ void ServerGameState::UpdateWorldGrid(fx::ServerInstanceBase* instance)
 		// only set world grid for the most focused position
 		const auto& pos = posns[0];
 
-		int minSectorX = std::max((pos.x - 299.0f) + 8192.0f, 0.0f) / 150;
-		int maxSectorX = std::max((pos.x + 299.0f) + 8192.0f, 0.0f) / 150;
-		int minSectorY = std::max((pos.y - 299.0f) + 8192.0f, 0.0f) / 150;
-		int maxSectorY = std::max((pos.y + 299.0f) + 8192.0f, 0.0f) / 150;
+		g_worldGridFocusPositions[uint16_t(client->GetNetId())] = glm::vec2(pos);
+
+		int minSectorX = std::max((pos.x - claimRadius) + 8192.0f, 0.0f) / 150;
+		int maxSectorX = std::max((pos.x + claimRadius) + 8192.0f, 0.0f) / 150;
+		int minSectorY = std::max((pos.y - claimRadius) + 8192.0f, 0.0f) / 150;
+		int maxSectorY = std::max((pos.y + claimRadius) + 8192.0f, 0.0f) / 150;
 
 		decltype(m_worldGrids)::iterator gridRef;
 
@@ -2668,12 +2681,52 @@ void ServerGameState::UpdateWorldGrid(fx::ServerInstanceBase* instance)
 			for (int y = minSectorY; y <= maxSectorY; y++)
 			{
 				// find if this x/y is owned by someone already
-				bool found = (grid->accel.netIDs[x][y] != 0xFFFF);
+				const uint16_t owner = grid->accel.netIDs[x][y];
+				bool found = (owner != 0xFFFF);
+				bool taken = false;
+
+				// nearest wins: a contested sector moves to whoever is clearly closer to its centre, skipping the cooldown so the loser can't reclaim it first
+				if (found && nearestWins && owner != netID)
+				{
+					const glm::vec2 centre{ (x + 0.5f) * 150.0f - 8192.0f, (y + 0.5f) * 150.0f - 8192.0f };
+					const float distance2 = glm::distance2(glm::vec2(pos), centre);
+					float ownerDistance2 = std::numeric_limits<float>::max();
+
+					if (auto ownerPos = g_worldGridFocusPositions.find(owner); ownerPos != g_worldGridFocusPositions.end())
+					{
+						ownerDistance2 = glm::distance2(ownerPos->second, centre);
+					}
+
+					if (distance2 < ownerDistance2 && std::sqrt(distance2) + nearestWinsMargin < std::sqrt(ownerDistance2) &&
+						std::any_of(std::begin(gridState->entries), std::end(gridState->entries), [](const WorldGridEntry& entry) { return entry.netID == 0xFFFF; }))
+					{
+						if (auto ownerClient = clientRegistry->GetClientByNetID(owner); ownerClient && ownerClient->GetSlotId() != -1 && GetClientDataUnlocked(this, ownerClient)->routingBucket == data->routingBucket)
+						{
+							for (auto& entry : grid->state[ownerClient->GetSlotId()].entries)
+							{
+								if (entry.netID == owner && entry.sectorX == x && entry.sectorY == y)
+								{
+									entry.sectorX = 0;
+									entry.sectorY = 0;
+									entry.netID = -1;
+
+									SendWorldGrid(&entry, ownerClient);
+
+									break;
+								}
+							}
+						}
+
+						grid->accel.netIDs[x][y] = -1;
+						found = false;
+						taken = true;
+					}
+				}
 
 				// if not, find out if we even have any chance at having an entity in there (cooldown of ~5 ticks, might need a more accurate query somewhen)
 				auto secAddr = (uint16_t(x) << 8) | y;
 
-				if (!found)
+				if (!found && !taken)
 				{
 					auto entry = data->worldGridCooldown.find(secAddr);
 
@@ -2687,7 +2740,7 @@ void ServerGameState::UpdateWorldGrid(fx::ServerInstanceBase* instance)
 						found = true;
 					}
 				}
-				else
+				else if (found)
 				{
 					data->worldGridCooldown.erase(secAddr);
 				}
@@ -3105,6 +3158,7 @@ void ServerGameState::HandleClientDrop(const fx::ClientSharedPtr& client, uint16
 	}
 
 	// clear the player's world grid ownership
+	g_worldGridFocusPositions.erase(netId);
 	ClearClientFromWorldGrid(client);
 
 	std::set<uint32_t> toErase;
@@ -8128,6 +8182,9 @@ static InitFunction initFunction([]()
 		g_oneSyncDistanceCullPlayers = instance->AddVariable<bool>("onesync_distanceCullPlayers", ConVar_None, false);
 		g_oneSyncPlayerScopeLimit = instance->AddVariable<int>("onesync_playerScopeLimit", ConVar_None, 0);
 		g_oneSyncPlayerScopeHysteresis = instance->AddVariable<int>("onesync_playerScopeHysteresis", ConVar_None, 2);
+		g_oneSyncWorldGridRadius = instance->AddVariable<int>("onesync_worldGridRadius", ConVar_None, 299);
+		g_oneSyncWorldGridNearestWins = instance->AddVariable<bool>("onesync_worldGridNearestWins", ConVar_None, false);
+		g_oneSyncWorldGridNearestWinsMargin = instance->AddVariable<int>("onesync_worldGridNearestWinsMargin", ConVar_None, 50);
 
 		fwRefContainer<fx::ServerGameState> sgs = new fx::ServerGameState();
 		instance->SetComponent(sgs);
