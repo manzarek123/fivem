@@ -125,6 +125,9 @@ static int g_requestControlSettleDelay;
 static std::shared_ptr<ConVar<int>> g_entitySettleVar;
 static int g_entitySettleDelay;
 
+static std::shared_ptr<ConVar<int>> g_frameBacklogIdleVar;
+static int g_frameBacklogIdleDelay;
+
 static uint32_t MakeHandleUniqifierPair(uint16_t objectId, uint16_t uniqifier)
 {
 	return ((uint32_t)objectId << 16) | (uint32_t)uniqifier;
@@ -2189,7 +2192,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			{
 				size_t thisMaxBacklog = maxSavedClientFrames;
 
-				if (client->GetLastSeen() > 5s)
+				if (g_frameBacklogIdleDelay <= 0 || msec() - client->GetLastSeen() > std::chrono::seconds{ g_frameBacklogIdleDelay })
 				{
 					thisMaxBacklog = maxSavedClientFramesWorstCase;
 				}
@@ -8112,6 +8115,7 @@ static InitFunction initFunction([]()
 		g_requestControlVar = instance->AddVariable<int>("sv_filterRequestControl", ConVar_None, (int)RequestControlFilterMode::NoFilter, (int*)&g_requestControlFilterState);
 		g_requestControlSettleVar = instance->AddVariable<int>("sv_filterRequestControlSettleTimer", ConVar_None, 30000, &g_requestControlSettleDelay);
 		g_entitySettleVar = instance->AddVariable<int>("onesync_entitySettleTimer", ConVar_None, 0, &g_entitySettleDelay);
+		g_frameBacklogIdleVar = instance->AddVariable<int>("onesync_frameBacklogIdleTimer", ConVar_None, 5, &g_frameBacklogIdleDelay);
 
 		fx::SetOneSyncGetCallback([]()
 		{
